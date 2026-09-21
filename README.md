@@ -22,7 +22,8 @@ as JSON. Multi-turn conversations reuse the same remote agent/session.
 Requires Node.js. Install globally so `agent-bridge` works from any directory:
 
 ```bash
-npm install -g <this repo or published package>   # gives you the `agent-bridge` command
+# install straight from the GitHub repo (gives you the `agent-bridge` command)
+npm install -g https://github.com/happyTonakai/paseo-agent-bridge
 agent-bridge --help
 ```
 
