@@ -39,7 +39,8 @@ on another machine).
    agent-bridge --target remote --list-agents
    agent-bridge --target remote --agent <existingId> "<task>"
    ```
-   Prefer agents whose status is `idle`; do not message one that is `running`.
+   If the reused agent is `running`, the bridge queues: it waits for it to
+   become idle before sending, then fails after `--timeout-ms` if still busy.
 
 ## Recommended flags
 

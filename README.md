@@ -168,5 +168,7 @@ You do not need the agent to know its own id. The daemon lists all agents:
 agent-bridge --target remote --list-agents   # shows agentId + status + title
 ```
 
-Then continue one of them with `--agent <id>`. Prefer an `idle` agent; one that
-is currently `running` may reject or queue a new message until it is free.
+Then continue one of them with `--agent <id>`. If the agent is currently
+`running`, the bridge waits for it to become idle (a coding agent serializes
+turns) before sending, so your message queues behind the active turn. If it
+stays busy past `--timeout-ms`, the call fails with a clear error.

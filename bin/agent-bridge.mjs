@@ -325,14 +325,28 @@ function main() {
       : client.agents.ref(agentId);
     liveAgentId = agent.id;
 
-    // On reuse, pre-flight before sending: a busy agent may resolve waitForFinish
-    // on the wrong turn. Refresh for a fresh snapshot (throws a clear error for
-    // an unknown id) and refuse to send while running or initializing.
+    // On reuse, pre-flight before sending: waitForFinish resolves on the current
+    // turn, so sending to a busy agent would return that turn's result instead of
+    // ours. Queue client-side: wait for the reused agent to become idle (a coding
+    // agent serializes turns), then send so our turn is the one we wait on.
     if (!created) {
-      await agent.refresh();
+      await agent.refresh(); // throws a clear error for an unknown id
+      const busyDeadline = Date.now() + timeoutMs;
+      const POLL_MS = 10_000; // busy is uncommon; don't hammer the daemon
+      while (
+        (agent.status === "running" || agent.status === "initializing") &&
+        Date.now() < busyDeadline
+      ) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        try {
+          await agent.refresh();
+        } catch {}
+      }
+      await agent.refresh().catch(() => {});
       if (agent.status === "running" || agent.status === "initializing") {
         throw new Error(
-          `agent ${agentId} is ${agent.status} on "${target.name}"; wait for it or pick an idle agent`,
+          `agent ${agentId} stayed ${agent.status} on "${target.name}" for ${timeoutMs}ms; ` +
+            `it may be stuck. Waited instead of sending — force with --archive or pick an idle agent.`,
         );
       }
     }
