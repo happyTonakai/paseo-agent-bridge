@@ -1,15 +1,11 @@
 #!/usr/bin/env node
-// Remote-agent bridge.
+// agent-bridge — paseo Agent Bridge.
 //
-// Connects to a daemon on THIS or ANOTHER machine and drives a coding agent
-// there. It prints the agent's final reply to stdout as JSON for the calling
-// process to consume. The agent on THIS machine drives the agent on THAT
-// machine: local agent -> relay -> remote daemon -> remote agent.
-//
-// Multiple machines are configured as named "targets" in config.json. Each
-// target is either a REMOTE machine reached through the relay (serverId +
-// publicKeyB64) or a LOCAL machine reached directly (url). Pick one with
-// --target <alias> (default: config.defaultTarget or the first target).
+// Companion CLI that drives coding agents on THIS or ANOTHER machine through
+// Paseo: one agent can command another. It connects to a Paseo daemon (via the
+// relay with E2EE, or directly) and either creates an agent there or reuses an
+// existing one, sends it a task, waits for the turn, and prints the FINAL reply
+// to stdout as JSON for the calling process to consume.
 //
 // Examples:
 //   agent-bridge "docker ps"                     # default target
@@ -96,13 +92,7 @@ function parseArgs(argv) {
 
 function resolveTarget(cfg, opts) {
   if (cfg.targets) {
-    const alias = opts.target ?? cfg.defaultTarget;
-    let name;
-    if (alias) {
-      name = alias;
-    } else {
-      name = Object.keys(cfg.targets)[0];
-    }
+    const name = opts.target ?? cfg.defaultTarget ?? Object.keys(cfg.targets)[0];
     const t = cfg.targets?.[name];
     if (!t) {
       console.error(
@@ -132,6 +122,16 @@ function resolveTarget(cfg, opts) {
 function buildConnection(target, cfg) {
   if (target.url) {
     // Direct connection (e.g. this machine's daemon). No relay, no E2EE.
+    let loopback = false;
+    try {
+      const u = new URL(target.url);
+      loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1";
+    } catch {
+      throw new Error(`invalid direct url for target "${target.name}": ${target.url}`);
+    }
+    if (!loopback) {
+      console.error("warning: direct target is not loopback; traffic is plaintext (no relay E2EE).");
+    }
     return { url: target.url, e2ee: undefined };
   }
   const url = buildRelayWebSocketUrl({
@@ -161,7 +161,7 @@ function main() {
   const configPath = resolveConfigPath(opts);
   if (!existsSync(configPath)) {
     console.error(
-      "No config found. Put one at " + defaultConfigHome() +
+      "No config found. Put one at " + configPath +
         " (see config.example.json), or pass --config <path>.",
     );
     process.exit(2);
@@ -184,14 +184,23 @@ function main() {
   const archive = opts.archive === true;
   const verbose = opts.verbose === true;
   const timeoutMs = Number(opts["timeout-ms"] ?? cfg.timeoutMs ?? 600_000);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    console.error("--timeout-ms must be a positive number of milliseconds");
+    process.exit(2);
+  }
+  const connectDeadlineMs = Number(cfg.connectTimeoutMs ?? 25_000);
+  if (!Number.isFinite(connectDeadlineMs) || connectDeadlineMs <= 0) {
+    console.error("connectTimeoutMs must be a positive number of milliseconds");
+    process.exit(2);
+  }
 
   const missing = [];
   if (!target.url && !cfg.relay?.endpoint) missing.push("relay.endpoint");
   if (!target.url && !target.serverId) missing.push("target.serverId");
   if (!target.url && !target.publicKeyB64) missing.push("target.publicKeyB64");
   // cwd is only needed to CREATE a new agent; reusing one (--agent) uses the
-  // agent's own stored working directory on the daemon.
-  if (!agentId && !cwd) missing.push("cwd (only needed when creating a new agent)");
+  // agent's own stored working directory, and listing needs no cwd at all.
+  if (!agentId && !cwd && !listAgents) missing.push("cwd (only needed when creating a new agent)");
   if (missing.length) {
     console.error(
       "Missing config fields for target \"" + target.name + "\" (edit " + configPath + " or pass flags): " +
@@ -200,167 +209,233 @@ function main() {
     process.exit(2);
   }
 
-  const { url, e2ee } = buildConnection(target, cfg);
+  let url, e2ee;
+  try {
+    ({ url, e2ee } = buildConnection(target, cfg));
+  } catch (err) {
+    console.error("agent-bridge error: bad connection config: " + err.message);
+    process.exit(2);
+  }
 
   const client = createPaseoClient({
     url,
     clientId: "agent-bridge-" + randomUUID(),
     ...(e2ee ? { e2ee } : {}),
     reconnect: { enabled: true, baseDelayMs: 500, maxDelayMs: 4000 },
-    connectTimeoutMs: 20_000,
+    connectTimeoutMs: connectDeadlineMs,
   });
 
-  let finished = false;
-  const done = async (code) => {
-    if (finished) return;
-    finished = true;
+  // Emit JSON to stdout and let the pipe drain before exiting (process.exit()
+  // can truncate a large piped write).
+  const emitAndExit = (obj, code) => {
+    process.stdout.write(JSON.stringify(obj, null, 2) + "\n", () => {
+      try {
+        client.close().catch(() => {});
+      } catch {}
+      process.exit(code);
+    });
+  };
+  // Abort path when there is nothing to emit (e.g. connect failure).
+  const fail = (msg) => {
+    console.error(msg);
     try {
-      await client.close();
+      client.close().catch(() => {});
     } catch {}
-    process.exit(code);
+    process.exit(1);
   };
 
-  client
-    .connect()
-    .then(async () => {
-      // Discovery mode: list agents on the target daemon so you can pick an
-      // existing agent's id and talk to it with --agent <id>.
-      if (listAgents) {
-        const r = await client.agents.list();
-        const rows = (r.entries ?? []).map((e) => {
-          const a = e.agent ?? e;
-          return {
-            agentId: a.id,
-            status: a.status ?? "?",
-            provider: a.provider ?? "?",
-            model: a.model ?? a.runtimeInfo?.model ?? null,
-            cwd: a.cwd ?? null,
-            title: a.title ?? null,
-            archivedAt: a.archivedAt ?? null,
-          };
-        });
-        console.log(JSON.stringify({ target: target.name, agents: rows }, null, 2));
-        await done(0);
-        return;
-      }
-
-      if (!provider) {
-        const avail = await client.providers.listAvailable();
-        const list = avail.providers ?? avail.entries ?? [];
-        const first = list.find((p) => p.enabled !== false)?.provider
-          ?? (Array.isArray(avail) ? avail[0]?.provider : null);
-        if (!first) {
-          throw new Error(
-            "No provider configured and none detected on the remote daemon. " +
-              "Set provider in config.json or pass --provider.",
-          );
-        }
-        provider = first;
-      }
-
-      // If no model was configured, ask that daemon for the provider's default
-      // model. SDK 0.8.0 requires config.provider as "provider/model" (first
-      // "/" splits), so a bare provider alone is not enough.
-      if (!model) {
-        try {
-          const m = await client.providers.listModels(provider);
-          const chosen = m.models?.find((x) => x.isDefault === true) ?? m.models?.[0];
-          if (chosen?.id) model = chosen.id;
-        } catch {}
-      }
-      const providerSelection = model ? `${provider}/${model}` : provider;
-
-      const created = !agentId;
-      const agent = created
-        ? await client.agents.create({
-            config: { provider: providerSelection },
-            cwd,
-            prompt: opts.task,
-            title: target.title ?? "agent-bridge",
-          })
-        : client.agents.ref(agentId);
-
-      const texts = [];
-      let errorText = null;
-      let pendingPermissions = 0;
-      const unsub = agent.timeline.subscribe((ev) => {
-        const event = ev?.event;
-        if (!event) return;
-        if (event.type === "timeline") {
-          const item = event.item;
-          if (!item) return;
-          if (item.type === "assistant_message") texts.push(item.text);
-          else if (item.type === "user_message") texts.push("\n[user] " + item.text);
-          else if (item.type === "error") {
-            errorText = item.message;
-            texts.push("\n[error] " + item.message);
-          }
-        } else if (event.type === "permission_requested") {
-          pendingPermissions += 1;
-          texts.push(`\n[permission needed] ${event.request?.title ?? event.request?.name}`);
-        } else if (event.type === "attention_required" && event.reason === "permission") {
-          texts.push("\n[attention required: permission]");
-        }
+  const run = async () => {
+    // Discovery mode: list agents on the target daemon so you can pick an
+    // existing agent's id and talk to it with --agent <id>.
+    if (listAgents) {
+      const r = await client.agents.list();
+      const rows = (r.entries ?? []).map((e) => {
+        const a = e.agent ?? e;
+        return {
+          agentId: a.id,
+          status: a.status ?? "?",
+          provider: a.provider ?? "?",
+          model: a.model ?? a.runtimeInfo?.model ?? null,
+          cwd: a.cwd ?? null,
+          title: a.title ?? null,
+          archivedAt: a.archivedAt ?? null,
+        };
       });
+      emitAndExit({ target: target.name, agents: rows }, 0);
+      return;
+    }
 
-      if (unsub && typeof unsub.ready === "function") {
-        try {
-          await unsub.ready;
-        } catch {}
+    if (!provider) {
+      const avail = await client.providers.listAvailable();
+      const list = avail.providers ?? [];
+      const unavailable = list.filter((p) => p.available !== true);
+      const first = list.find((p) => p.available === true)?.provider;
+      if (!first) {
+        throw new Error(
+          "No available provider on target \"" + target.name + "\". " +
+            (unavailable.length
+              ? "Unavailable: " + unavailable.map((p) => `${p.provider}${p.error ? ` (${p.error})` : ""}`).join(", ") + ". "
+              : "") +
+            "Set provider in config or pass --provider.",
+        );
       }
+      provider = first;
+    }
 
-      const result = created
-        ? await agent.waitForFinish(timeoutMs)
-        : await agent.run(opts.task, { timeoutMs });
-
-      await new Promise((r) => setTimeout(r, 800));
-
-      // Pull the authoritative timeline and take the most recent complete
-      // assistant message so token-chunked streaming fragments don't leak in.
-      let cleanReply = null;
+    // If no model was configured, ask that daemon for the provider's default
+    // model. SDK 0.8.0 requires config.provider as "provider/model" (first
+    // "/" splits), so a bare provider alone is not enough.
+    if (!model) {
+      let lookupError = null;
       try {
-        const tl = await agent.timeline.refetch({ direction: "tail", limit: 200 });
-        const entries = tl.entries ?? tl.items ?? [];
-        for (const entry of entries) {
-          const item = entry.item ?? entry;
-          if (item.type === "assistant_message") cleanReply = item.text;
-        }
-      } catch {}
-
-      const status = result.final?.status ?? result.status ?? "unknown";
-      const transcript = texts.join("\n").trim();
-      const reply = cleanReply ?? (transcript || `(no assistant text captured; final status: ${status})`);
-
-      const out = {
-        ok: !errorText && status !== "error" && status !== "failed",
-        target: target.name,
-        agentId: agent.id,
-        cwd,
-        provider,
-        model: model ?? null,
-        status,
-        reused: !created,
-        pendingPermissions,
-        reply,
-      };
-      if (verbose) out.transcript = transcript;
-
-      unsub?.();
-      // Agents are kept by default so their agentId stays reusable for later
-      // turns. Archive only when explicitly asked (--archive).
-      if (archive) {
-        try {
-          await agent.archive();
-          out.archived = true;
-        } catch {}
+        const m = await client.providers.listModels(provider);
+        const chosen = m.models?.find((x) => x.isDefault === true) ?? m.models?.[0];
+        if (chosen?.id) model = chosen.id;
+        if (!model) lookupError = m.error ? new Error(m.error) : null;
+      } catch (err) {
+        lookupError = err;
       }
+      if (!model) {
+        throw new Error(
+          `Could not resolve a default model for provider "${provider}" on target "${target.name}"` +
+            (lookupError ? ` (${lookupError.message})` : "") +
+            `. Set "model" in the config or pass --model <id>.`,
+        );
+      }
+    }
+    const providerSelection = `${provider}/${model}`;
 
-      console.log(JSON.stringify(out, null, 2));
-      await done(out.ok ? 0 : 1);
+    const created = !agentId;
+    const agent = created
+      ? await client.agents.create({
+          config: { provider: providerSelection },
+          cwd,
+          prompt: opts.task,
+          title: target.title ?? "agent-bridge",
+        })
+      : client.agents.ref(agentId);
+
+    const texts = [];
+    let errorText = null;
+    let streamedPermissions = 0;
+    const unsub = agent.timeline.subscribe((ev) => {
+      const event = ev?.event;
+      if (!event) return;
+      if (event.type === "timeline") {
+        const item = event.item;
+        if (!item) return;
+        if (item.type === "assistant_message") texts.push(item.text);
+        else if (item.type === "user_message") texts.push("\n[user] " + item.text);
+        else if (item.type === "error") {
+          errorText = errorText ?? item.message;
+          texts.push("\n[error] " + item.message);
+        }
+      } else if (event.type === "turn_failed") {
+        errorText = errorText ?? event.error;
+        texts.push("\n[turn failed] " + event.error);
+      } else if (event.type === "permission_requested") {
+        streamedPermissions += 1;
+        texts.push(`\n[permission needed] ${event.request?.title ?? event.request?.name}`);
+      } else if (event.type === "attention_required" && event.reason === "permission") {
+        texts.push("\n[attention required: permission]");
+      } else if (event.type === "attention_required" && event.reason === "error") {
+        errorText = errorText ?? "turn ended with an error (attention required)";
+      }
+    });
+
+    // Await the timeline demand before the turn moves on. unsub is callable WS
+    // subscription whose `.ready` is a Promise awaiting establish acknowledgement.
+    if (unsub?.ready) {
+      try {
+        await unsub.ready;
+      } catch {}
+    }
+
+    const result = created
+      ? await agent.waitForFinish(timeoutMs)
+      : await agent.run(opts.task, { timeoutMs });
+
+    // Authoritative values from the daemon; fall back to what we observed.
+    // result.status is the wait outcome: idle | error | permission | timeout.
+    // result.final.status is the agent lifecycle status.
+    const waitStatus = result.status ?? "unknown";
+    const agentStatus = result.final?.status ?? null;
+    errorText = errorText ?? result.error ?? null;
+    const pendingPermissions =
+      (result.final?.pendingPermissions?.length ?? 0) || streamedPermissions;
+
+    // Get the final assistant message from the daemon (authoritative per turn),
+    // falling back to the last one we observed.
+    let cleanReply = null;
+    try {
+      const tl = await agent.timeline.refetch({ direction: "tail", limit: 200 });
+      const entries = tl.entries ?? tl.items ?? [];
+      let best = null;
+      for (const entry of entries) {
+        const item = entry.item ?? entry;
+        if (item.type === "assistant_message") {
+          if (best === null || (entry.seqEnd ?? 0) >= (best.seqEnd ?? 0)) best = { seqEnd: entry.seqEnd, text: item.text };
+        }
+      }
+      cleanReply = best?.text ?? null;
+    } catch {}
+
+    const transcript = texts.join("\n").trim();
+    const reply =
+      result.lastMessage ?? cleanReply ?? (transcript || `(no assistant text captured; status: ${waitStatus})`);
+
+    // Trust the daemon's per-turn verdict. A streamed turn_failed can be a
+    // transient retry attempt inside a turn that ultimately succeeds, so a
+    // sticky errorText would otherwise flip ok to false on success.
+    const ok = waitStatus === "idle" && result.error == null;
+
+    const out = {
+      ok,
+      target: target.name,
+      agentId: agent.id,
+      cwd: result.final?.cwd ?? cwd ?? null,
+      provider: result.final?.provider ?? provider ?? null,
+      model: result.final?.model ?? model ?? null,
+      status: waitStatus,
+      agentStatus,
+      reused: !created,
+      pendingPermissions,
+      error: errorText ?? null,
+      reply,
+    };
+    if (verbose) out.transcript = transcript;
+
+    unsub?.();
+    // Agents are kept by default so their agentId stays reusable for later
+    // turns. Archive only when explicitly asked (--archive).
+    if (archive) {
+      try {
+        await agent.archive();
+        out.archived = true;
+      } catch {}
+    }
+
+    emitAndExit(out, ok ? 0 : 1);
+  };
+
+  // Bound only the initial connection: a failed/refused connect with reconnect
+  // enabled never settles, so guard it. Keep reconnect for mid-turn drops.
+  let guard;
+  const guardedConnection = Promise.race([
+    client.connect(),
+    new Promise((_, reject) => {
+      guard = setTimeout(() => reject(new Error(`cannot reach ${url} within ${connectDeadlineMs}ms`)), connectDeadlineMs);
+    }),
+  ]);
+
+  guardedConnection
+    .then(() => {
+      clearTimeout(guard);
+      return run();
     })
     .catch((err) => {
-      console.error("agent-bridge error: " + (err?.stack || err?.message || String(err)));
-      done(1);
+      clearTimeout(guard);
+      fail("agent-bridge error: " + (err?.message || String(err)));
     });
 }
 

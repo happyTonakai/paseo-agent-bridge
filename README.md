@@ -7,8 +7,8 @@ machine** through Paseo, so one agent can command another.
 agent on machine A --(relay E2EE / direct)--> daemon on machine B --> agent on B runs the task
 ```
 
-It depends only on the published `@getpaseo/client` SDK. It is **not** a Paseo
-plugin and does not need Paseo's source.
+It depends only on `@getpaseo/client` and `@getpaseo/protocol` from the public npm
+registry. It is **not** a Paseo plugin and does not need Paseo's source.
 
 ## Why
 
@@ -19,7 +19,8 @@ as JSON. Multi-turn conversations reuse the same remote agent/session.
 
 ## Install
 
-Requires Node.js. Install globally so `agent-bridge` works from any directory:
+Requires **Node.js 22+** (the Paseo SDK needs a global `WebSocket`). Install
+globally so `agent-bridge` works from any directory:
 
 ```bash
 # install straight from the GitHub repo (gives you the `agent-bridge` command)
@@ -130,14 +131,21 @@ agent-bridge --config ./other.json "task"
   "provider": "pi",
   "model": "sglang/deepseek-ai/DeepSeek-V4-Flash-0731",
   "status": "idle",
+  "agentStatus": "idle",
   "reused": false,
   "pendingPermissions": 0,
+  "error": null,
   "reply": "Docker version 28.1.1, build 4eba377"
 }
 ```
 
 - `reply` is the **final assistant message** of the turn (like a notification);
   intermediate `reasoning`/tool calls are not included unless `--verbose`.
+- `status` is the wait outcome: `idle` (success), `error`, `permission`, or
+  `timeout`. `agentStatus` is the agent lifecycle status.
+- `ok` is true only when `status === "idle"` and there is no error. A turn that
+  is paused waiting for `permission` or times out exits `1` (the agent stays
+  alive and can be continued later with `--agent`).
 - `agentId` is what you pass to `--agent` on later turns.
 - Exit code `0` success, `1` failure/timeout, `2` bad usage.
 
