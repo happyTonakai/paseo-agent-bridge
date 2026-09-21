@@ -189,7 +189,9 @@ function main() {
   if (!target.url && !cfg.relay?.endpoint) missing.push("relay.endpoint");
   if (!target.url && !target.serverId) missing.push("target.serverId");
   if (!target.url && !target.publicKeyB64) missing.push("target.publicKeyB64");
-  if (!cwd) missing.push("cwd (a working directory on the TARGET machine)");
+  // cwd is only needed to CREATE a new agent; reusing one (--agent) uses the
+  // agent's own stored working directory on the daemon.
+  if (!agentId && !cwd) missing.push("cwd (only needed when creating a new agent)");
   if (missing.length) {
     console.error(
       "Missing config fields for target \"" + target.name + "\" (edit " + configPath + " or pass flags): " +
