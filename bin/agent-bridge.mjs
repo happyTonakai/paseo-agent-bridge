@@ -40,15 +40,45 @@ const FLAGS = new Set([...BOOL_FLAGS, ...VALUE_FLAGS]);
 
 const DEFAULT_CONFIG_NAME = "agent-bridge.json";
 
-const USAGE = `usage: agent-bridge
-  [--config <p>] [--target <alias>] [--cwd <dir>] [--model <m>] [--provider <p>]
-  [--agent <id>] [--archive] [--verbose] [--timeout-ms <n>] [--list-agents]
-  ["<task>"]
+const USAGE = `agent-bridge - drive coding agents on this or any other machine through Paseo.
+One agent can command another. Config is read from ~/.paseo/${DEFAULT_CONFIG_NAME}
+(or --config).
 
-  --list-agents   list agents on the target (no task needed), then pick an id
+USAGE
+  agent-bridge [flags] ["task"]
+  agent-bridge --list-agents
 
-Config is read from ~/.paseo/${DEFAULT_CONFIG_NAME}; pass --config <path> to
-point at a different file.`;
+FLAGS
+  --target <alias>  which machine's agent to use (alias key in config, e.g. local, remote)
+  --list-agents     list agents on the target (no task needed), then pick an agentId
+  --agent <id>      continue an EXISTING agent instead of creating one (multi-turn)
+  --cwd <dir>       working dir for a NEW agent; must be absolute (daemon does not expand ~)
+  --provider <p>    provider name (auto-detected if omitted)
+  --model <m>       model id (defaults to the provider's default)
+  --archive         delete the agent after the turn (created agents are kept by default)
+  --verbose         include the full transcript in the JSON output
+  --timeout-ms <n>  max ms to wait for the turn (and for a busy agent to become idle)
+  --config <p>      config file (default ~/.paseo/${DEFAULT_CONFIG_NAME})
+
+AGENT WORKFLOW (follow every time)
+  1) Discover:  agent-bridge --target <alias> --list-agents
+       -> prints JSON {agents:[{agentId,status,...}]}. Pick an idle agentId.
+  2) One shot:  agent-bridge --target <alias> "task"
+       -> creates a NEW agent, runs it, returns the result. It is kept; reuse its agentId.
+  3) Multi-turn: agent-bridge --target <alias> --agent <id> "next thing"
+       -> continues that exact agent's session (its memory is retained).
+  4) Clean up:  agent-bridge --target <alias> --agent <id> --archive "final goodbye"
+
+OUTPUT (stdout is ALWAYS one JSON object)
+  { ok, target, agentId, cwd, status, agentStatus, reused, error, reply, pendingPermissions }
+  - ok      true only when status==="idle" and there is no error
+  - reply   the agent's final answer for this turn
+  - status  idle | error | permission | timeout
+  exit 0 on ok, nonzero otherwise. Always JSON.parse(stdout), never shell text.
+
+NOTES
+  A reused agent that is running is waited for (polls every 10s) until it becomes
+  idle, so your message queues behind its active turn; it fails after --timeout-ms.`;
 
 // Default config lives next to the Paseo home (distinct name), so a globally
 // installed agent-bridge picks it up from any directory.
