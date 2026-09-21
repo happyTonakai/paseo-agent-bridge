@@ -1,0 +1,23 @@
+{
+  "relay": {
+    "endpoint": "YOUR-RELAY-HOST:80",
+    "useTls": false
+  },
+  "defaultTarget": "remote",
+  "timeoutMs": 600000,
+  "targets": {
+    "remote": {
+      "serverId": "srv_XXXX",
+      "publicKeyB64": "REPLACE-WITH-REMOTE-DAEMON-PUBLIC-KEY",
+      "cwd": "/home/user/Docker",
+      "provider": "pi",
+      "model": "sglang/deepseek-ai/DeepSeek-V4-Flash-0731"
+    },
+    "local": {
+      "url": "ws://127.0.0.1:6767/ws",
+      "cwd": "/path/on/this/machine",
+      "provider": "pi",
+      "model": ""
+    }
+  }
+}

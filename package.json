@@ -1,0 +1,15 @@
+{
+  "name": "paseo-agent-bridge",
+  "version": "0.1.0",
+  "description": "Companion CLI that drives coding agents on this or other machines through Paseo - one agent can command another.",
+  "type": "module",
+  "bin": { "agent-bridge": "bin/agent-bridge.mjs" },
+  "files": ["bin", "config.example.json", "README.md"],
+  "engines": { "node": ">=18" },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@getpaseo/client": "0.8.0",
+    "@getpaseo/protocol": "0.8.0",
+    "@getpaseo/relay": "0.8.0"
+  }
+}

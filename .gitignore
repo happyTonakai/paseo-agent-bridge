@@ -1,0 +1,9 @@
+# Dependencies
+node_modules/
+
+# Real config contains relay pairing credentials (serverId + public key).
+# Do not commit it. Copy config.example.json to config.json and fill it in.
+config.json
+
+# Logs
+*.log
