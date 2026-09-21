@@ -29,7 +29,10 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createPaseoClient } from "@getpaseo/client";
-import { buildRelayWebSocketUrl } from "@getpaseo/protocol/daemon-endpoints";
+import {
+  buildRelayWebSocketUrl,
+  shouldUseTlsForDefaultHostedRelay,
+} from "@getpaseo/protocol/daemon-endpoints";
 
 const BOOL_FLAGS = new Set(["archive", "verbose", "list-agents"]);
 const VALUE_FLAGS = new Set(["config", "target", "cwd", "model", "provider", "agent", "timeout-ms"]);
@@ -136,7 +139,7 @@ function buildConnection(target, cfg) {
   }
   const url = buildRelayWebSocketUrl({
     endpoint: cfg.relay.endpoint,
-    useTls: cfg.relay.useTls ?? false,
+    useTls: cfg.relay.useTls ?? shouldUseTlsForDefaultHostedRelay(cfg.relay.endpoint),
     serverId: target.serverId,
     role: "client",
   });
@@ -235,13 +238,17 @@ function main() {
       process.exit(code);
     });
   };
-  // Abort path when there is nothing to emit (e.g. connect failure).
-  const fail = (msg) => {
+  // Id of the agent we created/refed for this call, so a failure after create
+  // doesn't orphan the agent from the caller's perspective.
+  let liveAgentId = null;
+
+  // Failure after a successful connect: still emit the documented JSON envelope
+  // so a calling agent's JSON.parse(stdout) always succeeds. stderr keeps the
+  // human-readable message; process errors that happen before connect still use
+  // direct process.exit(2) and are not JSON.
+  const fail = (msg, extra = {}) => {
     console.error(msg);
-    try {
-      client.close().catch(() => {});
-    } catch {}
-    process.exit(1);
+    emitAndExit({ ok: false, target: target.name, error: msg, reply: null, ...extra }, 1);
   };
 
   const run = async () => {
@@ -261,7 +268,7 @@ function main() {
           archivedAt: a.archivedAt ?? null,
         };
       });
-      emitAndExit({ target: target.name, agents: rows }, 0);
+      emitAndExit({ ok: true, target: target.name, reply: null, agents: rows }, 0);
       return;
     }
 
@@ -289,7 +296,9 @@ function main() {
       let lookupError = null;
       try {
         const m = await client.providers.listModels(provider);
-        const chosen = m.models?.find((x) => x.isDefault === true) ?? m.models?.[0];
+        const chosen =
+          m.models?.find((x) => x.isDefault === true && x.isSelectable !== false) ??
+          m.models?.find((x) => x.isSelectable !== false);
         if (chosen?.id) model = chosen.id;
         if (!model) lookupError = m.error ? new Error(m.error) : null;
       } catch (err) {
@@ -314,8 +323,22 @@ function main() {
           title: target.title ?? "agent-bridge",
         })
       : client.agents.ref(agentId);
+    liveAgentId = agent.id;
+
+    // On reuse, pre-flight before sending: a busy agent may resolve waitForFinish
+    // on the wrong turn. Refresh for a fresh snapshot (throws a clear error for
+    // an unknown id) and refuse to send while running or initializing.
+    if (!created) {
+      await agent.refresh();
+      if (agent.status === "running" || agent.status === "initializing") {
+        throw new Error(
+          `agent ${agentId} is ${agent.status} on "${target.name}"; wait for it or pick an idle agent`,
+        );
+      }
+    }
 
     const texts = [];
+    const streamedReply = []; // this turn's assistant text (subscription is turn-scoped)
     let errorText = null;
     let streamedPermissions = 0;
     const unsub = agent.timeline.subscribe((ev) => {
@@ -324,7 +347,10 @@ function main() {
       if (event.type === "timeline") {
         const item = event.item;
         if (!item) return;
-        if (item.type === "assistant_message") texts.push(item.text);
+        if (item.type === "assistant_message") {
+          streamedReply.push(item.text);
+          texts.push(item.text);
+        }
         else if (item.type === "user_message") texts.push("\n[user] " + item.text);
         else if (item.type === "error") {
           errorText = errorText ?? item.message;
@@ -361,33 +387,28 @@ function main() {
     const waitStatus = result.status ?? "unknown";
     const agentStatus = result.final?.status ?? null;
     errorText = errorText ?? result.error ?? null;
-    const pendingPermissions =
-      (result.final?.pendingPermissions?.length ?? 0) || streamedPermissions;
+    // The daemon snapshot is authoritative; the streamed count is only a
+    // fallback when there is no snapshot (e.g. timeout).
+    const pendingPermissions = result.final
+      ? (result.final.pendingPermissions?.length ?? 0)
+      : streamedPermissions;
 
-    // Get the final assistant message from the daemon (authoritative per turn),
-    // falling back to the last one we observed.
-    let cleanReply = null;
-    try {
-      const tl = await agent.timeline.refetch({ direction: "tail", limit: 200 });
-      const entries = tl.entries ?? tl.items ?? [];
-      let best = null;
-      for (const entry of entries) {
-        const item = entry.item ?? entry;
-        if (item.type === "assistant_message") {
-          if (best === null || (entry.seqEnd ?? 0) >= (best.seqEnd ?? 0)) best = { seqEnd: entry.seqEnd, text: item.text };
-        }
-      }
-      cleanReply = best?.text ?? null;
-    } catch {}
+    // ok follows the daemon's per-turn verdict. A streamed turn_failed can be a
+    // transient retry attempt inside a turn that ultimately succeeds, so a
+    // sticky errorText must not flip ok on success.
+    const ok = waitStatus === "idle" && result.error == null;
 
     const transcript = texts.join("\n").trim();
-    const reply =
-      result.lastMessage ?? cleanReply ?? (transcript || `(no assistant text captured; status: ${waitStatus})`);
 
-    // Trust the daemon's per-turn verdict. A streamed turn_failed can be a
-    // transient retry attempt inside a turn that ultimately succeeds, so a
-    // sticky errorText would otherwise flip ok to false on success.
-    const ok = waitStatus === "idle" && result.error == null;
+    // Prefer the daemon's authoritative per-turn lastMessage, then this turn's
+    // streamed assistant text (the subscription is scoped to this turn). Never
+    // fall back to a global timeline tail, which on a reused agent could return
+    // a previous turn's answer.
+    const streamedReplyText = streamedReply.join("\n").trim();
+    const reply =
+      result.lastMessage ??
+      (ok ? streamedReplyText : null) ??
+      (transcript || `(no assistant text captured; status: ${waitStatus})`);
 
     const out = {
       ok,
@@ -400,7 +421,8 @@ function main() {
       agentStatus,
       reused: !created,
       pendingPermissions,
-      error: errorText ?? null,
+      // Emit a single consistent error after the verdict: null on success.
+      error: ok ? null : errorText,
       reply,
     };
     if (verbose) out.transcript = transcript;
@@ -412,7 +434,10 @@ function main() {
       try {
         await agent.archive();
         out.archived = true;
-      } catch {}
+      } catch (err) {
+        out.archived = false;
+        out.archiveError = err?.message ?? String(err);
+      }
     }
 
     emitAndExit(out, ok ? 0 : 1);
@@ -424,7 +449,11 @@ function main() {
   const guardedConnection = Promise.race([
     client.connect(),
     new Promise((_, reject) => {
-      guard = setTimeout(() => reject(new Error(`cannot reach ${url} within ${connectDeadlineMs}ms`)), connectDeadlineMs);
+      let safeHost = url;
+      try {
+        safeHost = new URL(url).host; // host:port, no serverId query on stderr
+      } catch {}
+      guard = setTimeout(() => reject(new Error(`cannot reach ${safeHost} within ${connectDeadlineMs}ms`)), connectDeadlineMs);
     }),
   ]);
 
@@ -435,7 +464,10 @@ function main() {
     })
     .catch((err) => {
       clearTimeout(guard);
-      fail("agent-bridge error: " + (err?.message || String(err)));
+      fail(
+        "agent-bridge error: " + (err?.message || String(err)),
+        liveAgentId ? { agentId: liveAgentId } : {},
+      );
     });
 }
 
