@@ -190,6 +190,11 @@ function main() {
     process.exit(2);
   }
 
+  // Label the outbound task so the target agent knows this is an automated
+  // message from another agent, not a human user.
+  const AGENT_HEADER = "[from another agent via agent-bridge \u2014 not the user]";
+  const outboundTask = opts.task ? `${AGENT_HEADER}\n\n${opts.task}` : opts.task;
+
   let cfg;
   const configPath = resolveConfigPath(opts);
   if (!existsSync(configPath)) {
@@ -349,7 +354,7 @@ function main() {
       ? await client.agents.create({
           config: { provider: providerSelection },
           cwd,
-          prompt: opts.task,
+          prompt: outboundTask,
           title: target.title ?? "agent-bridge",
         })
       : client.agents.ref(agentId);
@@ -423,7 +428,7 @@ function main() {
 
     const result = created
       ? await agent.waitForFinish(timeoutMs)
-      : await agent.run(opts.task, { timeoutMs });
+      : await agent.run(outboundTask, { timeoutMs });
 
     // Authoritative values from the daemon; fall back to what we observed.
     // result.status is the wait outcome: idle | error | permission | timeout.
