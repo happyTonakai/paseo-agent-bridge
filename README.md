@@ -1,3 +1,5 @@
+> **English** · [中文文档](README.zh-CN.md)
+
 # agent-bridge — paseo Agent Bridge
 
 A small Node CLI that drives AI coding agents on **this machine or another
@@ -77,11 +79,18 @@ The config lists machines as named **targets**. Each target is either:
   model. If `provider` is empty, it auto-detects the first available.
 - Every call requires `--target <alias>`; run `--list-targets` to see them.
 
-### Find a target's details
+### Find a target's details (`serverId`, `publicKeyB64`)
 
-- `serverId` and `publicKeyB64`: read them on that machine from
-  `~/.paseo/server-id` and `~/.paseo/daemon-keypair.json` (`publicKeyB64`).
-- Relay address: `~/.paseo/config.json` → `daemon.relay.endpoint`.
+These are the **target daemon's** pairing credentials — they belong to the
+machine B you want to reach, not to the relay — and they live on that machine:
+
+- `serverId`: the target's daemon id, read from `~/.paseo/server-id` on that
+  machine (a `srv_XXXX` string).
+- `publicKeyB64`: the target daemon's public key, read from
+  `~/.paseo/daemon-keypair.json` on that machine → the `publicKeyB64` field.
+- Relay address (`relay.endpoint` / `relay.useTls`): `~/.paseo/config.json` →
+  `daemon.relay.endpoint`. `useTls` is `true` when that endpoint starts with
+  `wss://`, `false` for `ws://`.
 
 ### ⚠️ Direct local URL needs `/ws`
 
@@ -142,7 +151,8 @@ with no JSON):
 - `ok` is true only when `status === "idle"` and there is no error. A turn that
   is paused waiting for `permission` or times out exits `1` (the agent stays
   alive and can be continued later with `--agent`).
-- `agentId` is what you pass to `--agent` on later turns.
+- `agentId` is what you pass to `--agent` on later turns — a **Paseo agent id**,
+  not the underlying tool's session id (see below).
 - Exit code `0` success, `1` failure/timeout, `2` bad usage.
 
 ## Security
@@ -155,6 +165,25 @@ with no JSON):
   the credentials private.
 - On targets where the daemon asks for tool permission, the turn pauses until a
   decision is made; these agents are unattended, so pre-approve as needed.
+
+## agent ID, not session ID
+
+`--agent` takes a **Paseo agent ID** — the daemon's id for that agent session.
+It is **not** the session id that Claude Code, Codex, or Pi track internally;
+they are different ids for the same running agent. Get a Paseo agent id either
+way:
+
+- **Paseo client** (mobile app or web): open the agent tab, right-click the
+  agent, and choose **Copy agent ID**.
+- **CLI**: list agents on a target and read the `agentId` column:
+  `agent-bridge --target <alias> --list-agents`.
+
+Then pass it with `--agent <id>`.
+
+```bash
+# copy the id from the client, then reuse the SAME running agent
+agent-bridge --target remote --agent <id> "continue"
+```
 
 ## Talk to an existing agent on another machine
 
