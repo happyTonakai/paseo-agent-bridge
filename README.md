@@ -51,7 +51,6 @@ The config lists machines as named **targets**. Each target is either:
 ```jsonc
 {
   "relay": { "endpoint": "proxy-10063...:80", "useTls": false },
-  "defaultTarget": "remote",
   "timeoutMs": 600000,
   "targets": {
     "remote": {
@@ -72,10 +71,11 @@ The config lists machines as named **targets**. Each target is either:
 ```
 
 - **Multi-turn is the default**: a created agent is kept and its `agentId` is
-  returned so you can keep talking to it. Only `--archive` cleans it up.
+  returned so you can keep talking to it. This tool never deletes agents; clean
+  up with the native `paseo archive <id>`.
 - If `model` is empty, the tool asks that daemon for the provider's default
   model. If `provider` is empty, it auto-detects the first available.
-- Pick a target with `--target <alias>` (default: `defaultTarget` or the first).
+- Every call requires `--target <alias>`; run `--list-targets` to see them.
 
 ### Find a target's details
 
@@ -92,10 +92,8 @@ daemon. (Relay URLs already carry `/ws` themselves.)
 ## Usage
 
 ```bash
-# Single turn on the default target
-agent-bridge "docker ps"
-
-# Choose a target-by-alias / override cwd or model
+# One shot — creates a NEW agent on the target, runs one turn, returns its reply
+agent-bridge --target remote "docker ps"
 agent-bridge --target remote --cwd /home/user/Docker "docker ps"
 agent-bridge --target remote --model <other-model> "task"
 
@@ -108,19 +106,17 @@ agent-bridge --target remote --agent <agentId> "describe the diff"
 agent-bridge --target remote --list-agents
 agent-bridge --target remote --agent <existingId> "continue"
 
-# Clean up a session when done
-agent-bridge --target remote --agent <agentId> --archive "wrap up"
-
 # Debug: include the full trace (default prints only the final reply)
-agent-bridge --verbose "task"
+agent-bridge --target remote --verbose "task"
 
 # Use a different config file
-agent-bridge --config ./other.json "task"
+agent-bridge --config ./other.json --target remote "task"
 ```
 
 ## Output
 
-`stdout` gets one JSON object:
+`stdout` gets one JSON object (exit 0/1; a usage error exits 2 and prints to stderr
+with no JSON):
 
 ```json
 {

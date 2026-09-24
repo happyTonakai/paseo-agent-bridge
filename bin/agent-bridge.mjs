@@ -8,19 +8,21 @@
 // to stdout as JSON for the calling process to consume.
 //
 // Examples:
-//   agent-bridge "docker ps"                     # default target
-//   agent-bridge --target remote "task"           # a remote machine (via relay)
-//   agent-bridge --target local "task"            # this machine's daemon
-//   agent-bridge --cwd /some/dir "task"           # override cwd
-//   agent-bridge --model <m> "task"               # override model
-//   agent-bridge --verbose "task"                 # also print full trace
+//   agent-bridge --target local "docker ps"        # create a NEW agent, one turn
+//   agent-bridge --target remote "task"            # same, a remote machine (via relay)
+//   agent-bridge --target remote --cwd /some/dir "task"   # override cwd
+//   agent-bridge --target remote --model <m> "task"       # override model
+//   agent-bridge --target remote --verbose "task"         # also print full trace
+//
+// Every one-shot call WITHOUT --agent creates a NEW agent on the target; there
+// is no "default agent" that runs commands. The target is chosen by the user.
 //
 // Continuous conversation (multi-turn is the norm):
-//   agent-bridge "first task"   # agent is kept; read agentId from output
-//   agent-bridge --agent <id> "next"   # same session, keeps context
+//   agent-bridge --target remote "first task"   # creates a NEW agent; read agentId
+//   agent-bridge --target remote --agent <id> "next"   # same session, keeps context
 //
-// A created agent is kept so you can reuse its agentId on later turns. Pass
-// --archive to clean up the agent when you are done with it.
+// A created agent is kept so you can reuse its agentId on later turns. Cleanup is
+// done with the native paseo CLI (paseo archive <id>), never by this tool.
 //
 // Exit codes: 0 success, 1 failure/timeout, 2 bad usage.
 
@@ -34,7 +36,7 @@ import {
   shouldUseTlsForDefaultHostedRelay,
 } from "@getpaseo/protocol/daemon-endpoints";
 
-const BOOL_FLAGS = new Set(["archive", "verbose", "list-agents"]);
+const BOOL_FLAGS = new Set(["verbose", "list-agents", "list-targets"]);
 const VALUE_FLAGS = new Set(["config", "target", "cwd", "model", "provider", "agent", "timeout-ms"]);
 const FLAGS = new Set([...BOOL_FLAGS, ...VALUE_FLAGS]);
 
@@ -49,36 +51,43 @@ USAGE
   agent-bridge --list-agents
 
 FLAGS
-  --target <alias>  which machine's agent to use (alias key in config, e.g. local, remote)
-  --list-agents     list agents on the target (no task needed), then pick an agentId
+  --target <alias>   which machine's agent to use (user-provided; confirm exact spelling with --list-targets)
+  --list-targets     list configured target aliases, to confirm the exact string a user named
+  --list-agents      list agents on a target; requires --target <alias>
   --agent <id>      continue an EXISTING agent instead of creating one (multi-turn)
   --cwd <dir>       working dir for a NEW agent; must be absolute (daemon does not expand ~)
   --provider <p>    provider name (auto-detected if omitted)
   --model <m>       model id (defaults to the provider's default)
-  --archive         delete the agent after the turn (created agents are kept by default)
   --verbose         include the full transcript in the JSON output
   --timeout-ms <n>  max ms to wait for the turn (and for a busy agent to become idle)
   --config <p>      config file (default ~/.paseo/${DEFAULT_CONFIG_NAME})
 
-AGENT WORKFLOW (follow every time)
-  1) Discover:  agent-bridge --target <alias> --list-agents
-       -> prints JSON {agents:[{agentId,status,...}]}. Pick an idle agentId.
-  2) One shot:  agent-bridge --target <alias> "task"
+AGENT WORKFLOW
+  - The target comes from the USER. Use the exact target they name; if unsure of
+    its exact spelling (case, whitespace, etc.), run --list-targets to confirm the
+    string, then pass that exact value to --target <alias>. Never pick a target
+    yourself.
+  1) One shot:  agent-bridge --target <alias> "task"
        -> creates a NEW agent, runs it, returns the result. It is kept; reuse its agentId.
-  3) Multi-turn: agent-bridge --target <alias> --agent <id> "next thing"
+  2) Multi-turn: agent-bridge --target <alias> --agent <id> "next thing"
        -> continues that exact agent's session (its memory is retained).
-  4) Clean up:  agent-bridge --target <alias> --agent <id> --archive "final goodbye"
+  - Reuse an agentId across follow-ups instead of creating new ones. Do not archive
+    or delete a remote agent unless the user asked to clean it up.
 
-OUTPUT (stdout is ALWAYS one JSON object)
-  { ok, target, agentId, cwd, status, agentStatus, reused, error, reply, pendingPermissions }
+OUTPUT (stdout is one JSON object for exit 0/1)
+  { ok, target, agentId, cwd, provider, model, status, agentStatus, reused,
+    pendingPermissions, error, reply }
   - ok      true only when status==="idle" and there is no error
   - reply   the agent's final answer for this turn
   - status  idle | error | permission | timeout
-  exit 0 on ok, nonzero otherwise. Always JSON.parse(stdout), never shell text.
+  exit 0 on ok, 1 on failure (both emit JSON). exit 2 is a usage error and prints
+  to stderr with no JSON; check the exit code before JSON.parse(stdout).
 
 NOTES
   A reused agent that is running is waited for (polls every 10s) until it becomes
-  idle, so your message queues behind its active turn; it fails after --timeout-ms.`;
+  idle, so your message queues behind its active turn; it fails after --timeout-ms.
+  Created agents are kept so you can reuse them; this tool never deletes agents.
+  Cleanup is done with the native paseo CLI (paseo archive <id>), not by an agent.`;
 
 // Default config lives next to the Paseo home (distinct name), so a globally
 // installed agent-bridge picks it up from any directory.
@@ -110,7 +119,7 @@ function parseArgs(argv) {
         continue;
       }
       const val = argv[++i];
-      if (val === undefined) {
+      if (val === undefined || val.startsWith("--")) {
         console.error("Flag --" + key + " needs a value\n" + USAGE);
         process.exit(2);
       }
@@ -124,20 +133,33 @@ function parseArgs(argv) {
 }
 
 function resolveTarget(cfg, opts) {
+  // --target is mandatory for every operation: no defaultTarget / first-config
+  // fallback, so a caller never silently targets the wrong machine.
+  if (cfg.targets && !opts.target) {
+    console.error(
+      "Missing --target <alias>. Available: " +
+        Object.keys(cfg.targets).join(", ") +
+        " (see --list-targets).",
+    );
+    process.exit(2);
+  }
   if (cfg.targets) {
-    const name = opts.target ?? cfg.defaultTarget ?? Object.keys(cfg.targets)[0];
-    const t = cfg.targets?.[name];
+    const t = cfg.targets?.[opts.target];
     if (!t) {
       console.error(
-        `No target "${name}". Available: ${Object.keys(cfg.targets).join(", ")}. ` +
-          "Pass --target <alias> or set defaultTarget.",
+        `No target "${opts.target}". Available: ${Object.keys(cfg.targets).join(", ")}. ` +
+          "Run --list-targets to see them; pass --target <alias>.",
       );
       process.exit(2);
     }
-    return { name, ...t };
+    return { name: opts.target, ...t };
   }
-  // Backward compatibility: single "remote.*" config acts as target "default".
+  // Backward compatibility: single "remote.*" config, addressed as "default".
   if (cfg.remote) {
+    if (opts.target && opts.target !== "default") {
+      console.error(`No target "${opts.target}"; this config only has "default".`);
+      process.exit(2);
+    }
     return {
       name: "default",
       serverId: cfg.remote.serverId,
@@ -185,7 +207,7 @@ function main() {
     process.exit(2);
   }
   const opts = parseArgs(process.argv.slice(2));
-  if (!opts.task && !opts["list-agents"]) {
+  if (!opts.task && !opts["list-agents"] && !opts["list-targets"]) {
     console.error(USAGE);
     process.exit(2);
   }
@@ -211,6 +233,16 @@ function main() {
     process.exit(2);
   }
 
+  // --list-targets: enumerate configured aliases so a first-time caller doesn't
+  // have to open the config JSON. No target needed; exits before connection.
+  if (opts["list-targets"]) {
+    const targets = cfg.targets
+      ? Object.keys(cfg.targets).map((name) => ({ name }))
+      : [{ name: "default" }]; // backward-compat single remote config
+    process.stdout.write(JSON.stringify({ ok: true, targets }, null, 2) + "\n");
+    process.exit(0);
+  }
+
   const target = resolveTarget(cfg, opts);
 
   // CLI flags override the selected target's values.
@@ -219,9 +251,8 @@ function main() {
   let model = (opts.model ?? target.model)?.trim();
   const agentId = opts.agent;
   const listAgents = opts["list-agents"] === true;
-  const archive = opts.archive === true;
   const verbose = opts.verbose === true;
-  const timeoutMs = Number(opts["timeout-ms"] ?? cfg.timeoutMs ?? 600_000);
+  let timeoutMs = Number(opts["timeout-ms"] ?? cfg.timeoutMs ?? 600_000);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     console.error("--timeout-ms must be a positive number of milliseconds");
     process.exit(2);
@@ -283,7 +314,24 @@ function main() {
   // direct process.exit(2) and are not JSON.
   const fail = (msg, extra = {}) => {
     console.error(msg);
-    emitAndExit({ ok: false, target: target.name, error: msg, reply: null, ...extra }, 1);
+    emitAndExit(
+      {
+        ok: false,
+        target: target.name,
+        agentId: liveAgentId ?? null,
+        cwd: null,
+        provider: provider ?? null,
+        model: model ?? null,
+        status: "error",
+        agentStatus: null,
+        reused: null,
+        pendingPermissions: 0,
+        error: msg,
+        reply: null,
+        ...extra,
+      },
+      1,
+    );
   };
 
   const run = async () => {
@@ -364,26 +412,38 @@ function main() {
     // turn, so sending to a busy agent would return that turn's result instead of
     // ours. Queue client-side: wait for the reused agent to become idle (a coding
     // agent serializes turns), then send so our turn is the one we wait on.
+    // timeoutMs is one shared budget for the whole wait (busy + turn).
     if (!created) {
       await agent.refresh(); // throws a clear error for an unknown id
       const busyDeadline = Date.now() + timeoutMs;
       const POLL_MS = 10_000; // busy is uncommon; don't hammer the daemon
+      let lastRefreshError = null;
       while (
         (agent.status === "running" || agent.status === "initializing") &&
         Date.now() < busyDeadline
       ) {
-        await new Promise((r) => setTimeout(r, POLL_MS));
+        await new Promise((r) =>
+          setTimeout(r, Math.max(1, Math.min(POLL_MS, busyDeadline - Date.now()))),
+        );
         try {
           await agent.refresh();
-        } catch {}
+          lastRefreshError = null;
+        } catch (err) {
+          lastRefreshError = err;
+        }
       }
-      await agent.refresh().catch(() => {});
+      await agent.refresh().catch((err) => {
+        lastRefreshError = lastRefreshError ?? err;
+      });
       if (agent.status === "running" || agent.status === "initializing") {
         throw new Error(
           `agent ${agentId} stayed ${agent.status} on "${target.name}" for ${timeoutMs}ms; ` +
-            `it may be stuck. Waited instead of sending — force with --archive or pick an idle agent.`,
+            `it may be stuck. Waited instead of sending — pick an idle agent.` +
+            (lastRefreshError ? ` (last refresh error: ${lastRefreshError.message})` : ""),
         );
       }
+      // Consume the busy wait from the shared budget before the turn.
+      timeoutMs = Math.max(1, busyDeadline - Date.now());
     }
 
     const texts = [];
@@ -452,12 +512,21 @@ function main() {
     // Prefer the daemon's authoritative per-turn lastMessage, then this turn's
     // streamed assistant text (the subscription is scoped to this turn). Never
     // fall back to a global timeline tail, which on a reused agent could return
-    // a previous turn's answer.
+    // a previous turn's answer. On failure, fall back to the transcript minus
+    // any echoed user line so we never reflect the caller's own task back.
     const streamedReplyText = streamedReply.join("\n").trim();
+    // "" is not nullish: normalize an empty stream so it can't override the
+    // transcript fallback (L: reply falls through when no assistant text).
+    const assistantText = (ok && streamedReplyText) || null;
+    const replyFallback = transcript
+      .split("\n")
+      .filter((l) => l.trim() && !l.trim().startsWith("[user]"))
+      .join("\n")
+      .trim();
     const reply =
       result.lastMessage ??
-      (ok ? streamedReplyText : null) ??
-      (transcript || `(no assistant text captured; status: ${waitStatus})`);
+      assistantText ??
+      (replyFallback || `(no assistant text captured; status: ${waitStatus})`);
 
     const out = {
       ok,
@@ -478,16 +547,8 @@ function main() {
 
     unsub?.();
     // Agents are kept by default so their agentId stays reusable for later
-    // turns. Archive only when explicitly asked (--archive).
-    if (archive) {
-      try {
-        await agent.archive();
-        out.archived = true;
-      } catch (err) {
-        out.archived = false;
-        out.archiveError = err?.message ?? String(err);
-      }
-    }
+    // turns; this tool never deletes them. Cleanup is done with the native
+    // paseo CLI (paseo archive <id>).
 
     emitAndExit(out, ok ? 0 : 1);
   };

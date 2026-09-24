@@ -3,8 +3,8 @@
     "endpoint": "YOUR-RELAY-HOST:80",
     "useTls": false
   },
-  "defaultTarget": "remote",
   "timeoutMs": 600000,
+  "connectTimeoutMs": 25000,
   "targets": {
     "remote": {
       "serverId": "srv_XXXX",

@@ -15,8 +15,9 @@ agent-bridge [flags] "<task>"
 (`agent-bridge` is installed globally; if you run it from source use
 `node <repo>/bin/agent-bridge.mjs` instead.)
 
-It prints one JSON object to stdout. Read the `reply` field — that is the
-remote agent's final answer. `ok:true` means the turn finished cleanly.
+It prints one JSON object to stdout (including on a connect/turn failure, exit 0/1).
+Read the `reply` field — that is the remote agent's final answer. `ok:true` means
+ the turn finished cleanly. A usage error exits 2 and prints to stderr with no JSON.
 
 ## When to use it
 
@@ -26,7 +27,7 @@ on another machine).
 
 ## Normal flow
 
-1. **Pick a machine** with `--target <alias>` (default target is used if omitted):
+1. **Pick a machine** with `--target <alias>` (required; see `--list-targets`):
    ```bash
    agent-bridge --target remote "<task>"   # remote machine (via relay)
    agent-bridge --target local "<task>"    # this machine's own daemon
@@ -45,9 +46,9 @@ on another machine).
 ## Recommended flags
 
 - `--cwd <dir>` — working directory on the target (overrides config default).
-- `--archive` — archive the agent when this call finishes (cleanup).
 - `--verbose` — include the full trace; omit it to get only the final `reply`.
 - No `model`/`provider` needed if the config target already sets them.
+- This tool never archives/deletes agents; clean up with the native `paseo archive`.
 
 ## Output contract
 
